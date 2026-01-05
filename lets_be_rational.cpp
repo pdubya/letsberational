@@ -3,7 +3,7 @@
 //
 // ======================================================================================
 // Copyright © 2013-2017 Peter Jäckel.
-// 
+//
 // Permission to use, copy, modify, and distribute this software is freely granted,
 // provided that this notice is preserved.
 //
@@ -36,9 +36,10 @@
 
 #include "normaldistribution.h"
 #include "rationalcubic.h"
-#include <float.h>
+#include <cfloat>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 #if defined(_WIN32) || defined(_WIN64)
 # include <windows.h>
 #endif
@@ -51,44 +52,38 @@
 #define PI_OVER_SIX                   0.523598775598298873077107230546583814032861566563
 
 namespace {
-   static const double SQRT_DBL_EPSILON = sqrt(DBL_EPSILON);
-   static const double FOURTH_ROOT_DBL_EPSILON = sqrt(SQRT_DBL_EPSILON);
-   static const double EIGHTH_ROOT_DBL_EPSILON = sqrt(FOURTH_ROOT_DBL_EPSILON);
-   static const double SIXTEENTH_ROOT_DBL_EPSILON = sqrt(EIGHTH_ROOT_DBL_EPSILON);
-   static const double SQRT_DBL_MIN = sqrt(DBL_MIN);
-   static const double SQRT_DBL_MAX = sqrt(DBL_MAX);
+   const double SQRT_DBL_EPSILON = sqrt(DBL_EPSILON);
+   const double FOURTH_ROOT_DBL_EPSILON = sqrt(SQRT_DBL_EPSILON);
+   const double EIGHTH_ROOT_DBL_EPSILON = sqrt(FOURTH_ROOT_DBL_EPSILON);
+   const double SIXTEENTH_ROOT_DBL_EPSILON = sqrt(EIGHTH_ROOT_DBL_EPSILON);
+   const double SQRT_DBL_MIN = sqrt(DBL_MIN);
+   const double SQRT_DBL_MAX = sqrt(DBL_MAX);
 
    // Set this to 0 if you want positive results for (positive) denormalised inputs, else to DBL_MIN.
    // Note that you cannot achieve full machine accuracy from denormalised inputs!
-   static const double DENORMALISATION_CUTOFF = 0; 
+   constexpr double DENORMALISATION_CUTOFF = 0;
 
-   static const double VOLATILITY_VALUE_TO_SIGNAL_PRICE_IS_BELOW_INTRINSIC = -DBL_MAX;
-   static const double VOLATILITY_VALUE_TO_SIGNAL_PRICE_IS_ABOVE_MAXIMUM = DBL_MAX;
+   constexpr double VOLATILITY_VALUE_TO_SIGNAL_PRICE_IS_BELOW_INTRINSIC = -DBL_MAX;
+   constexpr double VOLATILITY_VALUE_TO_SIGNAL_PRICE_IS_ABOVE_MAXIMUM = DBL_MAX;
 
    inline bool is_below_horizon(double x){ return fabs(x) < DENORMALISATION_CUTOFF; } // This weeds out denormalised (a.k.a. 'subnormal') numbers.
 
-   // See https://www.kernel.org/doc/Documentation/atomic_ops.txt for further details on this simplistic implementation of an atomic flag that is *not* volatile.
-   typedef struct { 
-#if defined(_MSC_VER) || defined(_WIN32) || defined(_WIN64)
-      long data;
-#else
-      int data;
-#endif
-   } atomic_t;
-
-   static atomic_t implied_volatility_maximum_iterations = { 2 }; // (DBL_DIG*20)/3 ≈ 100 . Only needed when the iteration effectively alternates Householder/Halley/Newton steps and binary nesting due to roundoff truncation.
+   // Use C++11 std::atomic for portability across platforms (macOS/Darwin, Linux, Windows, etc.).
+   // Previously the code used a platform-specific typedef and InterlockedExchange on Windows.
+   std::atomic<int> implied_volatility_maximum_iterations = { 2 }; // (DBL_DIG*20)/3 ≈ 100 . Only needed when the iteration effectively alternates Householder/Halley/Newton steps and binary nesting due to roundoff truncation.
 
 #ifdef ENABLE_SWITCHING_THE_OUTPUT_TO_ITERATION_COUNT
-   static atomic_t implied_volatility_output_type = { 0 };
-   inline double implied_volatility_output(int count, double volatility){ return implied_volatility_output_type.data>0 ? count : volatility; }
+   std::atomic<int> implied_volatility_output_type = { 0 };
+   inline double implied_volatility_output(int count, double volatility){ return implied_volatility_output_type.load(std::memory_order_relaxed)>0 ? count : volatility; }
 #else
    inline double implied_volatility_output(int count, double volatility){ return volatility; }
 #endif
 
 #ifdef ENABLE_CHANGING_THE_HOUSEHOLDER_METHOD_ORDER
-   static atomic_t implied_volatility_householder_method_order = { 4 };
+   std::atomic<int> implied_volatility_householder_method_order = { 4 };
    inline double householder_factor(double newton, double halley, double hh3){
-      return implied_volatility_householder_method_order.data > 3 ? (1+0.5*halley*newton)/(1+newton*(halley+hh3*newton/6)) : ( implied_volatility_householder_method_order.data > 2 ? 1/(1+0.5*halley*newton) : 1 );
+      int order = implied_volatility_householder_method_order.load(std::memory_order_relaxed);
+      return order > 3 ? (1+0.5*halley*newton)/(1+newton*(halley+hh3*newton/6)) : ( order > 2 ? 1.0/(1+0.5*halley*newton) : 1.0 );
    }
 #else
    inline double householder_factor(double newton, double halley, double hh3){ return (1+0.5*halley*newton)/(1+newton*(halley+hh3*newton/6)); }
@@ -97,48 +92,30 @@ namespace {
 }
 
 EXPORT_EXTERN_C double set_implied_volatility_maximum_iterations(double t){
-   int i = (int)t;
+   int i = static_cast<int>(t);
    if (i>=0) {
-#if defined(_MSC_VER) || defined(_WIN32) || defined(_WIN64)
-      InterlockedExchange(&(implied_volatility_maximum_iterations.data),i);
-#elif defined( __x86__ ) || defined( __x86_64__ ) || defined(__arm64__)
-      implied_volatility_maximum_iterations.data = i;
-#else
-# error Atomic operations not implemented for this platform.
-#endif
+      implied_volatility_maximum_iterations.store(i, std::memory_order_relaxed);
    }
-   return implied_volatility_maximum_iterations.data;
+   return implied_volatility_maximum_iterations.load(std::memory_order_relaxed);
 }
 
 #ifdef ENABLE_SWITCHING_THE_OUTPUT_TO_ITERATION_COUNT
 EXPORT_EXTERN_C double set_implied_volatility_output_type(double t){
-   int i = (int)t;
-#if defined(_MSC_VER) || defined(_WIN32) || defined(_WIN64)
-   InterlockedExchange(&(implied_volatility_output_type.data),i);
-#elif defined( __x86__ ) || defined( __x86_64__ ) || defined(__arm64__)
-   implied_volatility_output_type.data = i;
-#else
-# error Atomic operations not implemented for this platform.
-#endif
-   return implied_volatility_output_type.data;
+   int i = static_cast<int>(t);
+   implied_volatility_output_type.store(i, std::memory_order_relaxed);
+   return implied_volatility_output_type.load(std::memory_order_relaxed);
 }
-#endif  
+#endif
 
 #ifdef ENABLE_CHANGING_THE_HOUSEHOLDER_METHOD_ORDER
 EXPORT_EXTERN_C double set_implied_volatility_householder_method_order(double t){
-   int i = (int)t;
+   int i = static_cast<int>(t);
    if (i>=0) {
-#if defined(_MSC_VER) || defined(_WIN32) || defined(_WIN64)
-      InterlockedExchange(&(implied_volatility_householder_method_order.data),i);
-#elif defined( __x86__ ) || defined( __x86_64__ ) || defined(__arm64__)
-      implied_volatility_householder_method_order.data = i;
-#else
-# error Atomic operations not implemented for this platform.
-#endif
+      implied_volatility_householder_method_order.store(i, std::memory_order_relaxed);
    }
-   return implied_volatility_householder_method_order.data;
+   return implied_volatility_householder_method_order.load(std::memory_order_relaxed);
 }
-#endif  
+#endif
 
 double normalised_intrinsic(double x, double q /* q=±1 */){
    if (q*x<=0)
@@ -181,7 +158,7 @@ double asymptotic_expansion_of_normalised_black_call(double h, double t){
    return fabs(std::max(b , 0.));
 }
 
-namespace { /* η */ static const double asymptotic_expansion_accuracy_threshold = -10; }
+namespace { /* η */ constexpr double asymptotic_expansion_accuracy_threshold = -10; }
 
 double normalised_black_call_using_erfcx(double h, double t) {
    // Given h = x/s and t = s/2, the normalised Black function can be written as
@@ -247,7 +224,7 @@ double small_t_expansion_of_normalised_black_call(double h, double t){
    return fabs(std::max(b,0.0));
 }
 
-namespace { /* τ */ static const double small_t_expansion_of_normalised_black_threshold = 2*SIXTEENTH_ROOT_DBL_EPSILON; }
+namespace { /* τ */ const double small_t_expansion_of_normalised_black_threshold = 2*SIXTEENTH_ROOT_DBL_EPSILON; }
 
 //     b(x,s)  =  Φ(x/s+s/2)·exp(x/2)  -   Φ(x/s-s/2)·exp(-x/2)
 //             =  Φ(h+t)·exp(x/2)      -   Φ(h-t)·exp(-x/2)
@@ -334,7 +311,7 @@ EXPORT_EXTERN_C double black(double F, double K, double sigma, double T, double 
 }
 
 #ifdef COMPUTE_LOWER_MAP_DERIVATIVES_INDIVIDUALLY
-double f_lower_map(const double x,const double s){ 
+double f_lower_map(const double x,const double s){
    if (is_below_horizon(x))
       return 0;
    if (is_below_horizon(s))
@@ -376,7 +353,7 @@ void compute_f_lower_map_and_first_two_derivatives(const double x,const double s
 #endif
 
 double inverse_f_lower_map(const double x,const double f){
-   return is_below_horizon(f) ? 0 : fabs(x/(SQRT_THREE*inverse_norm_cdf( std::pow( f/(TWO_PI_OVER_SQRT_TWENTY_SEVEN*fabs(x)) , 1./3.) ))); 
+   return is_below_horizon(f) ? 0 : fabs(x/(SQRT_THREE*inverse_norm_cdf( std::pow( f/(TWO_PI_OVER_SQRT_TWENTY_SEVEN*fabs(x)) , 1./3.) )));
 }
 
 #ifdef COMPUTE_UPPER_MAP_DERIVATIVES_INDIVIDUALLY
@@ -437,7 +414,6 @@ double unchecked_normalised_implied_volatility_from_a_transformed_rational_guess
    // Map puts to calls
    if (q<0){
       x = -x;
-      q = -q;
    }
    if (beta<=0) // For negative or zero prices we return 0.
       return implied_volatility_output(0,0);
@@ -528,7 +504,7 @@ double unchecked_normalised_implied_volatility_from_a_transformed_rational_guess
          }
          s = inverse_f_upper_map(f);
          s_left = s_h;
-         if (beta>0.5*b_max) { // Else we better drop through and let the objective function be g(s) = b(x,s)-beta. 
+         if (beta>0.5*b_max) { // Else we better drop through and let the objective function be g(s) = b(x,s)-beta.
             //
             // In this branch, which comprises the upper segment, the objective function is
             //     g(s) = ln(b_max-beta)-ln(b_max-b(x,s))
@@ -614,7 +590,7 @@ EXPORT_EXTERN_C double implied_volatility_from_a_transformed_rational_guess_with
 }
 
 EXPORT_EXTERN_C double implied_volatility_from_a_transformed_rational_guess(double price, double F, double K, double T, double q /* q=±1 */){
-   return implied_volatility_from_a_transformed_rational_guess_with_limited_iterations(price,F,K,T,q,implied_volatility_maximum_iterations.data);
+   return implied_volatility_from_a_transformed_rational_guess_with_limited_iterations(price,F,K,T,q,implied_volatility_maximum_iterations.load(std::memory_order_relaxed));
 }
 
 EXPORT_EXTERN_C double normalised_implied_volatility_from_a_transformed_rational_guess_with_limited_iterations(double beta, double x, double q /* q=±1 */, int N){
@@ -629,5 +605,5 @@ EXPORT_EXTERN_C double normalised_implied_volatility_from_a_transformed_rational
 }
 
 EXPORT_EXTERN_C double normalised_implied_volatility_from_a_transformed_rational_guess(double beta, double x, double q /* q=±1 */){
-   return normalised_implied_volatility_from_a_transformed_rational_guess_with_limited_iterations(beta,x,q,implied_volatility_maximum_iterations.data);
+   return normalised_implied_volatility_from_a_transformed_rational_guess_with_limited_iterations(beta,x,q,implied_volatility_maximum_iterations.load(std::memory_order_relaxed));
 }
